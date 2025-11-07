@@ -65,6 +65,7 @@ Ensemble d'outils PowerShell pour preparer un master Windows avant generalisatio
 - `Invoke-AppxCleanupOnce` combine `Remove-AppxPackage` et `Remove-AppxProvisionedPackage`; `-Exclude` permet de conserver certaines apps.
 - `Invoke-SysprepCleanupLoop` relance Sysprep jusqu'a disparition des erreurs ou blocage critique.
 - Detection des erreurs 0x80310039 (BitLocker), 0x80073CF2 (AppX obstinee) et Reserved Storage occupe (0x800F0975 / 0x80070975).
+- Avant chaque nettoyage/Sysprep, `Ensure-ReservedStorageScenarioClear` lit `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager\ActiveScenario`; si la valeur est differente de 0, le script explique le probleme et propose (auto en `-Yes`) de la forcer a 0 via `Set-ItemProperty`.
 - `Ensure-BitLockerReady` appelle `manage-bde -off` si necessaire et relaye les informations a l'utilisateur.
 - Possibilite d'executer un script de restauration personnalise avant chaque Sysprep (`-PreSysprepRestoreScript`).
 - Codes de sortie : 0 succes, 1 echec generique, 2 BitLocker actif, 3 AppX resistant, 4 Reserved Storage.
@@ -119,7 +120,7 @@ Ensemble d'outils PowerShell pour preparer un master Windows avant generalisatio
 
 - **0x80310039 BitLocker** : verifier `manage-bde -status`, suspendre ou desactiver, puis relancer Phase 2.
 - **0x80073CF2 AppX** : supprimer manuellement le package resilient, relancer sysprep_cleaner.
-- **Reserved Storage** : suivre les commandes suggerees (DISM StartComponentCleanup puis Set-ReservedStorageState).
+- **Reserved Storage** : suivre les commandes suggerees (DISM StartComponentCleanup puis Set-ReservedStorageState). Le script controle aussi `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager\ActiveScenario`; forcer `Set-ItemProperty -Path ... -Name ActiveScenario -Value 0` s'il reste bloque.
 - **Services WU** : lancer `restore-update-services-*.bat` ou relancer Phase 2 pour restaurer automatiquement.
 - **Phase 2 non relancee** : supprimer `state.json`, `service-states.json`, la tache `SysprepFix-Phase2`, puis executer `prepare_master.ps1 -Phase 2`.
 - **Boucle sur les memes erreurs** : purger `setupact.log` et `setuperr.log`, verifier les transcripts dans `logs\`.
