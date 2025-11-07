@@ -414,6 +414,128 @@ function Test-ReservedStorageBusyInSysprepLogs {
     return $false
 }
 
+function Get-ReservedStorageActiveScenarioState {
+    param(
+        [string]$RegistryPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager',
+        [string]$ValueName = 'ActiveScenario'
+    )
+
+    $state = [pscustomobject]@{
+        Exists   = $false
+        Value    = $null
+        IsActive = $false
+    }
+
+    if (-not (Test-Path -LiteralPath $RegistryPath)) {
+        Write-Verbose ("Cle ReserveManager introuvable ({0})." -f $RegistryPath)
+        return $state
+    }
+
+    try {
+        $props = Get-ItemProperty -LiteralPath $RegistryPath -Name $ValueName -ErrorAction Stop
+        if ($null -eq $props) { return $state }
+        $value = $props.$ValueName
+        $state.Exists = $true
+        $state.Value = $value
+        if ($null -eq $value) { return $state }
+
+        $numericValue = $null
+        if ($value -is [ValueType]) {
+            try { $numericValue = [long]$value } catch { $numericValue = $null }
+        }
+        if ($null -eq $numericValue) {
+            $stringValue = [string]$value
+            if (-not [string]::IsNullOrWhiteSpace($stringValue)) {
+                $trimmed = $stringValue.Trim()
+                if ($trimmed -match '^0x[0-9a-fA-F]+$') {
+                    try { $numericValue = [Convert]::ToInt64($trimmed,16) } catch { $numericValue = $null }
+                } else {
+                    [long]::TryParse($trimmed, [ref]$numericValue) | Out-Null
+                }
+            }
+        }
+
+        if ($null -ne $numericValue) {
+            $state.IsActive = ($numericValue -ne 0)
+        } else {
+            $stringEval = [string]$value
+            $state.IsActive = -not [string]::IsNullOrWhiteSpace($stringEval) -and -not $stringEval.Trim().Equals('0',[System.StringComparison]::OrdinalIgnoreCase)
+        }
+    } catch {
+        Write-Verbose ("Lecture de ActiveScenario impossible ({0}\\{1}) : {2}" -f $RegistryPath, $ValueName, $_.Exception.Message)
+    }
+
+    return $state
+}
+
+function Reset-ReservedStorageActiveScenario {
+    param(
+        [string]$RegistryPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager',
+        [string]$ValueName = 'ActiveScenario'
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $RegistryPath)) {
+            return $false
+        }
+        Set-ItemProperty -LiteralPath $RegistryPath -Name $ValueName -Value 0 -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Verbose ("Impossible de positionner ActiveScenario a 0 ({0}\\{1}) : {2}" -f $RegistryPath, $ValueName, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Ensure-ReservedStorageScenarioClear {
+    param(
+        [switch]$Yes,
+        [string]$RegistryPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager',
+        [string]$ValueName = 'ActiveScenario'
+    )
+
+    $state = Get-ReservedStorageActiveScenarioState -RegistryPath $RegistryPath -ValueName $ValueName
+    if (-not $state.IsActive) {
+        return $true
+    }
+
+    $displayValue = if ($null -eq $state.Value) { '(null)' } else { $state.Value }
+    Write-Log ("Erreur : Reserved Storage signale un scenario actif (ActiveScenario={0})." -f $displayValue) -ForegroundColor Red
+    Write-Log "Windows Update/servicing monopolise encore l'espace reserve. Sysprep echouera tant que cette valeur reste differente de 0." -ForegroundColor Yellow
+
+    $shouldForce = $false
+    if ($Yes) {
+        $shouldForce = $true
+        Write-Log "Mode -Yes : tentative automatique de forcer ActiveScenario a 0." -ForegroundColor DarkYellow
+    } else {
+        $response = Read-Host "Forcer maintenant ActiveScenario a 0 ? (O/N)"
+        if ($response -in @('O','o','Y','y')) {
+            $shouldForce = $true
+        }
+    }
+
+    if ($shouldForce) {
+        Write-Log "Tentative de remise a zero de Reserved Storage ActiveScenario..." -ForegroundColor DarkYellow
+        if (Reset-ReservedStorageActiveScenario -RegistryPath $RegistryPath -ValueName $ValueName) {
+            $state = Get-ReservedStorageActiveScenarioState -RegistryPath $RegistryPath -ValueName $ValueName
+            if (-not $state.IsActive) {
+                Write-Log "ActiveScenario force a 0 avec succes." -ForegroundColor Green
+                return $true
+            }
+            $displayValue = if ($null -eq $state.Value) { '(null)' } else { $state.Value }
+            Write-Log ("ActiveScenario reste non nul ({0}) malgre la tentative de correction." -f $displayValue) -ForegroundColor Red
+        } else {
+            Write-Log "Impossible de modifier la valeur ActiveScenario automatiquement." -ForegroundColor Red
+        }
+
+        Write-Log "Corrigez manuellement via : Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager' -Name 'ActiveScenario' -Value 0" -ForegroundColor Yellow
+        return $false
+    }
+
+    Write-Log "Operation interrompue tant que Reserved Storage reste actif." -ForegroundColor Yellow
+    Write-Log "Commande proposee : Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager' -Name 'ActiveScenario' -Value 0" -ForegroundColor Yellow
+    return $false
+}
+
 function Get-BitLockerVolumeInfo {
     param(
         [string]$MountPoint = 'C:'
@@ -964,6 +1086,10 @@ function Invoke-AppxCleanupOnce {
         return $script:EXIT_RESERVED_STORAGE
     }
 
+    if (-not (Ensure-ReservedStorageScenarioClear -Yes:$Yes)) {
+        return $script:EXIT_RESERVED_STORAGE
+    }
+
     $getParams = @{
         LogPath = $LogPath
         Exclude = $Exclude
@@ -1064,6 +1190,10 @@ function Invoke-SysprepCleanupLoop {
                 Write-Log ("Boucle interrompue avant lancement de Sysprep (iteration #{0})." -f $iteration) -ForegroundColor Yellow
                 return $script:EXIT_SUCCESS
             }
+        }
+
+        if (-not (Ensure-ReservedStorageScenarioClear -Yes:$Yes)) {
+            return $script:EXIT_RESERVED_STORAGE
         }
 
         $exitCode = Invoke-SysprepProcess -Executable $sysprepExe -Arguments $sysprepArgs -PreSysprepRestoreScript $resolvedPreSysprepScript
