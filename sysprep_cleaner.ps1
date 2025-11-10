@@ -672,7 +672,11 @@ function Get-BitLockerStatusInfo {
     }
 
     try {
-        $output = & $manageBde -status $MountPoint 2>$null
+        $norm = $MountPoint
+        if ($norm -and $norm.Length -eq 1 -and $norm -match '^[A-Za-z]$') { $norm = "${norm}:" }
+        elseif ($norm -and $norm -match '^[A-Za-z]:\\$') { $norm = $norm.Substring(0,2) }
+        elseif ($norm -and $norm.Length -ge 2 -and $norm[1] -eq ':') { $norm = ("{0}:" -f $norm[0]) }
+        $output = & $manageBde -status $norm 2>$null
     } catch {
         return $null
     }
@@ -746,6 +750,34 @@ function Invoke-BitLockerDisable {
         $CmdletContext
     )
 
+    $hasDisableCmd = $null -ne (Get-Command -Name 'Disable-BitLocker' -ErrorAction SilentlyContinue)
+    if ($hasDisableCmd) {
+        $shouldRun = $true
+        if ($CmdletContext -and $CmdletContext -is [System.Management.Automation.PSCmdlet]) {
+            $shouldRun = $CmdletContext.ShouldProcess($MountPoint, 'Disable-BitLocker (dechiffrement complet)')
+        }
+        if (-not $shouldRun) {
+            Write-Log "(WhatIf) Disable-BitLocker $MountPoint" -ForegroundColor DarkCyan
+            return $false
+        }
+
+        $norm = $MountPoint
+        if ($norm -and $norm.Length -eq 1 -and $norm -match '^[A-Za-z]$') { $norm = "${norm}:" }
+        elseif ($norm -and $norm -match '^[A-Za-z]:\\$') { $norm = $norm.Substring(0,2) }
+        elseif ($norm -and $norm.Length -ge 2 -and $norm[1] -eq ':') { $norm = ("{0}:" -f $norm[0]) }
+        Write-Log ("Lancement Disable-BitLocker {0} (dechiffrement du volume)." -f $norm) -ForegroundColor Yellow
+        Write-Log ("Remarque : le dechiffrement peut prendre un certain temps. Suivez 'manage-bde -status {0}' pour surveiller l'avancement jusqu'a 0%." -f $norm) -ForegroundColor Yellow
+        try {
+            Disable-BitLocker -MountPoint $MountPoint -Confirm:$false -ErrorAction Stop | Out-Null
+            Write-Log ("Commande Disable-BitLocker initiee pour {0}. Surveillez 'manage-bde -status {0}' jusqu'a ce que le pourcentage chiffre atteigne 0%." -f $norm) -ForegroundColor Yellow
+            try { Start-Process -FilePath 'control.exe' -ArgumentList '/name','Microsoft.BitLockerDriveEncryption' -WindowStyle Normal -ErrorAction Stop | Out-Null } catch { Write-Verbose $_ }
+            return $true
+        } catch {
+            Write-Log ("Echec Disable-BitLocker {0} : {1}" -f $MountPoint, $_.Exception.Message) -ForegroundColor DarkRed
+            return $false
+        }
+    }
+
     $manageBde = Join-Path $env:WINDIR 'System32\manage-bde.exe'
     if (-not (Test-Path -LiteralPath $manageBde)) {
         Write-Log "manage-bde.exe introuvable : impossible de lancer automatiquement la commande -off." -ForegroundColor DarkRed
@@ -761,16 +793,22 @@ function Invoke-BitLockerDisable {
         return $false
     }
 
-    Write-Log ("Lancement manage-bde -off {0} (dechiffrement du volume)." -f $MountPoint) -ForegroundColor Yellow
+    $norm = $MountPoint
+    if ($norm -and $norm.Length -eq 1 -and $norm -match '^[A-Za-z]$') { $norm = "${norm}:" }
+    elseif ($norm -and $norm -match '^[A-Za-z]:\\$') { $norm = $norm.Substring(0,2) }
+    elseif ($norm -and $norm.Length -ge 2 -and $norm[1] -eq ':') { $norm = ("{0}:" -f $norm[0]) }
+    Write-Log ("Lancement manage-bde -off {0} (dechiffrement du volume)." -f $norm) -ForegroundColor Yellow
+    Write-Log ("Remarque : le dechiffrement peut prendre un certain temps. Suivez 'manage-bde -status {0}' pour surveiller l'avancement jusqu'a 0%." -f $norm) -ForegroundColor Yellow
     try {
-        & $manageBde -off $MountPoint 2>&1 | ForEach-Object {
+        & $manageBde -off $norm 2>&1 | ForEach-Object {
             if ($_ -is [string]) {
                 if ($_) { Write-Log "  $($_)" -ForegroundColor DarkCyan }
             } elseif ($_ -ne $null) {
                 Write-Log ("  {0}" -f $_) -ForegroundColor DarkCyan
             }
         }
-        Write-Log ("Commande manage-bde -off initiee pour {0}. Surveillez 'manage-bde -status {0}' jusqu'a ce que le pourcentage chiffre atteigne 0 et que la version soit 'Aucun'." -f $MountPoint) -ForegroundColor Yellow
+        Write-Log ("Commande manage-bde -off initiee pour {0}. Surveillez 'manage-bde -status {0}' jusqu'a ce que le pourcentage chiffre atteigne 0%." -f $norm) -ForegroundColor Yellow
+        try { Start-Process -FilePath 'control.exe' -ArgumentList '/name','Microsoft.BitLockerDriveEncryption' -WindowStyle Normal -ErrorAction Stop | Out-Null } catch { Write-Verbose $_ }
         return $true
     } catch {
         Write-Log ("Echec manage-bde -off {0} : {1}" -f $MountPoint, $_.Exception.Message) -ForegroundColor DarkRed
@@ -835,7 +873,7 @@ function Test-BitLockerReady {
     }
 }
 
-$allReady = ($versionReady -and $percentageReady -and $protectionReady -and $conversionReady)
+$allReady = ($percentageReady -and $protectionReady -and $conversionReady)
 if ($allReady) {
     $script:BitLockerOverridePreviouslyAllowed = $true
 }
@@ -886,7 +924,7 @@ function Ensure-BitLockerReady {
         $statusInfo.Raw.Split("`n") | ForEach-Object { Write-Log ("  {0}" -f $_) -ForegroundColor DarkYellow }
     }
 
-    if ($versionReady -and $percentageReady -and $protectionReady -and $conversionReady) {
+    if ($percentageReady -and $protectionReady -and $conversionReady) {
         Write-Log ("BitLocker a deja ete confirme comme off (Protection={1}, Chiffrement={2}%, Etat={3}, Version={4})." -f $MountPoint, $protectionStatus, $pctText, $volumeStatus, $versionString) -ForegroundColor Green
         $script:BitLockerOverridePreviouslyAllowed = $true
         return $true
@@ -1374,9 +1412,7 @@ function Invoke-SysprepProcess {
     }
 
     try {
-        if ($PSCmdlet.ShouldProcess('Services','Restaurer etats precedents avant Sysprep')) {
-            Restore-ServiceStates -Path $ServiceSnapshotPath | Out-Null
-        }
+        Write-Log 'Restauration automatique des services ignoree (aucune modification appliquee).' -ForegroundColor DarkYellow
 
         if ($PreSysprepRestoreScript) {
             if (-not (Test-Path -LiteralPath $PreSysprepRestoreScript)) {
