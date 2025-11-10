@@ -1,6 +1,6 @@
 # SysprepFiX
 
-Ensemble d'outils PowerShell pour preparer un master Windows avant generalisation : gel des services susceptibles de bloquer Sysprep, neutralisation de BitLocker, nettoyage des applications UWP problematiques et orchestration complete avec reprise automatique.
+Ensemble d'outils PowerShell pour preparer un master Windows avant generalisation : verifications critiques (BitLocker, AppX), nettoyage des applications UWP problematiques et orchestration complete avec reprise automatique.
 
 ## Contenu du depot
 
@@ -8,8 +8,8 @@ Ensemble d'outils PowerShell pour preparer un master Windows avant generalisatio
 - `sysprep_cleaner.ps1` : analyse `setupact.log`, suppression des paquets AppX bloquants, boucle Sysprep jusqu'au succes.
 - `PrepareMaster_Launcher.bat` : lance `prepare_master.ps1` avec transcript automatique.
 - `SysprepCleaner_RunAndLog.bat` : lance `sysprep_cleaner.ps1 -Yes -RunSysprep` et journalise l'execution.
-- `logs\` : dossier cible pour les transcripts et les scripts de restauration generes.
-- `state.json`, `service-states.json` (generes) : fichiers d'etat temporaires pour la reprise de phase et la restauration des services Windows Update.
+- `logs\` : dossier cible pour les transcripts generes.
+- `state.json` (genere) : fichier d'etat temporaire pour la reprise de phase.
 
 ## Prerequis
 
@@ -23,7 +23,7 @@ Ensemble d'outils PowerShell pour preparer un master Windows avant generalisatio
 | Etape | Phase | Description |
 | --- | --- | --- |
 | Pre-checks | Phase 1 (`-Phase 1`) | Verifie espace disque, reboot en attente, appartenance domaine, lance le transcript principal. |
-| Gel Windows Update | Phase 1 | Stoppe wuauserv/bits/UsoSvc/TrustedInstaller, force Delivery Optimization en mode bypass, sauvegarde l'etat des services. |
+| Services Windows Update | Phase 1 | Aucun gel automatique : le script consigne simplement que les services restent actifs. |
 | BitLocker | Phase 1 | Suspend BitLocker (cmdlet et manage-bde), confirme que Sysprep pourra generaliser. |
 | Hygiene rapide | Phase 1 | Nettoie `%TEMP%` et `C:\Windows\Temp`, purge optionnelle des journaux. |
 | Preparation Sysprep | Phase 1 | Supprime `Sysprep_succeeded.tag`, alterne les cartes reseau et propose le redemarrage pour Phase 2. |
@@ -36,28 +36,25 @@ Ensemble d'outils PowerShell pour preparer un master Windows avant generalisatio
 ### Phase 1
 
 1. `Assert-Admin`, `Test-DiskSpace`, `Test-PendingReboot`, `Test-DomainMembership`.
-2. `Disable-UpdateServices`, `Invoke-DismComponentCleanup`, `Disable-TrustedInstallerService`.
-3. `Export-ServiceRestoreScript` genere `restore-update-services-YYYYMMDD-HHMMSS.bat`, `Save-ServiceStatesToFile` sauvegarde `service-states.json`.
-4. `Suspend-SystemBitLocker` puis `Assert-BitLockerGeneralizeReady` valident l'absence de verrouillage BitLocker.
-5. `Clear-TempFolders` et `Clear-AllEventLogs` (optionnel).
-6. `Remove-SysprepTag`, `Toggle-Network`.
-7. Invite a redemarrer pour Phase 2 : `New-Phase2StateFile` et `Register-Phase2ResumeTask` preparent la reprise automatique.
+2. `Disable-UpdateServices` journalise que le gel est desactive, `Invoke-DismComponentCleanup` reste actif, `Disable-TrustedInstallerService` se contente d'un log.
+3. `Suspend-SystemBitLocker` puis `Assert-BitLockerGeneralizeReady` valident l'absence de verrouillage BitLocker.
+4. `Clear-TempFolders` et `Clear-AllEventLogs` (optionnel).
+5. `Remove-SysprepTag`, `Toggle-Network`.
+6. Invite a redemarrer pour Phase 2 : `New-Phase2StateFile` et `Register-Phase2ResumeTask` preparent la reprise automatique.
 
 ### Phase 2
 
 1. Supprime la tache planifiee et les entrees Run/RunOnce associees (`Remove-Phase2StartupEntries`).
-2. Charge `service-states.json`, relance `Restore-UpdateServicesState`, verifie `TrustedInstaller` et `wuauserv` (`Assert-PreSysprepServicesReady`).
+2. Passe directement aux controles `Assert-PreSysprepServicesReady` (TrustedInstaller, wuauserv) sans tenter de restaurer un snapshot de services.
 3. Rafraichit reseau et tag Sysprep, puis construit les arguments pour `sysprep_cleaner.ps1`.
 4. Lance `sysprep_cleaner` avec transcript horodate, propage les parametres (`-RunSysprepAfterCleaner`, `-SysprepAction`, `-SysprepMode`, `-NoGeneralize`, `-SysprepUnattend`, `-SysprepCleanerAutoYes`).
-5. Bloc `finally` : restauration des services, suppression de `state.json` et `service-states.json`, fermeture du transcript.
+5. Bloc `finally` : supprime `state.json` et ferme le transcript.
 
 ### Artefacts generes
 
 - `logs\prepare-master-YYYYMMDD-HHMMSS.log` : transcript principal.
 - `logs\sysprep_cleaner-YYYYMMDD-HHMMSS.log` : transcript sysprep_cleaner.
-- `restore-update-services-YYYYMMDD-HHMMSS.bat` : remise des services Windows Update.
 - `state.json` : drapeau Phase 2 (supprime automatiquement).
-- `service-states.json` : snapshot des services (supprime automatiquement).
 
 ## Details sur `sysprep_cleaner.ps1`
 
@@ -65,6 +62,8 @@ Ensemble d'outils PowerShell pour preparer un master Windows avant generalisatio
 - `Invoke-AppxCleanupOnce` combine `Remove-AppxPackage` et `Remove-AppxProvisionedPackage`; `-Exclude` permet de conserver certaines apps.
 - `Invoke-SysprepCleanupLoop` relance Sysprep jusqu'a disparition des erreurs ou blocage critique.
 - Detection des erreurs 0x80310039 (BitLocker), 0x80073CF2 (AppX obstinee) et Reserved Storage occupe (0x800F0975 / 0x80070975).
+- Tentative de desactivation BitLocker : essaie `Disable-BitLocker -MountPoint C:` (PowerShell) si disponible, sinon bascule automatiquement sur `manage-bde -off`.
+- Lorsque le dechiffrement est lance, le script rappelle que l'operation peut prendre longtemps et conseille de suivre `manage-bde -status C:` jusqu'a Protection=Off et Pourcentage=0%.
 - Avant chaque nettoyage/Sysprep, `Ensure-ReservedStorageScenarioClear` lit `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager\ActiveScenario`; si la valeur est differente de 0, le script explique le probleme et propose (auto en `-Yes`) de la forcer a 0 via `Set-ItemProperty`.
 - `Ensure-BitLockerReady` appelle `manage-bde -off` si necessaire et relaye les informations a l'utilisateur.
 - Possibilite d'executer un script de restauration personnalise avant chaque Sysprep (`-PreSysprepRestoreScript`).
@@ -112,8 +111,6 @@ Ensemble d'outils PowerShell pour preparer un master Windows avant generalisatio
 - `logs\prepare-master-*.log` : transcript global.
 - `logs\sysprep_cleaner-*.log` : journal detaille des suppressions et tentatives Sysprep.
 - `logs\run-*.log` : transcript genere par `SysprepCleaner_RunAndLog.bat`.
-- `restore-update-services-*.bat` : script autonome pour remettre les services Windows Update.
-- `service-states.json` : snapshot des services (recrée a chaque run).
 - `state.json` : drapeau de reprise Phase 2.
 
 ## Depannage
@@ -121,8 +118,7 @@ Ensemble d'outils PowerShell pour preparer un master Windows avant generalisatio
 - **0x80310039 BitLocker** : verifier `manage-bde -status`, suspendre ou desactiver, puis relancer Phase 2.
 - **0x80073CF2 AppX** : supprimer manuellement le package resilient, relancer sysprep_cleaner.
 - **Reserved Storage** : suivre les commandes suggerees (DISM StartComponentCleanup puis Set-ReservedStorageState). Le script controle aussi `HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager\ActiveScenario`; forcer `Set-ItemProperty -Path ... -Name ActiveScenario -Value 0` s'il reste bloque.
-- **Services WU** : lancer `restore-update-services-*.bat` ou relancer Phase 2 pour restaurer automatiquement.
-- **Phase 2 non relancee** : supprimer `state.json`, `service-states.json`, la tache `SysprepFix-Phase2`, puis executer `prepare_master.ps1 -Phase 2`.
+- **Phase 2 non relancee** : supprimer `state.json`, la tache `SysprepFix-Phase2`, puis executer `prepare_master.ps1 -Phase 2`.
 - **Boucle sur les memes erreurs** : purger `setupact.log` et `setuperr.log`, verifier les transcripts dans `logs\`.
 
 ## Utilisation conseillee
@@ -131,7 +127,7 @@ Ensemble d'outils PowerShell pour preparer un master Windows avant generalisatio
 2. Suivre les invites Phase 1, accepter le redemarrage si BitLocker l'exige.
 3. Laisser la machine redemarrer, la Phase 2 reprend automatiquement; sinon lancer `.\prepare_master.ps1 -Phase 2`.
 4. En mode interactif, confirmer les suppressions AppX (ou fournir `-SysprepCleanerAutoYes`).
-5. Apres succes, conserver les transcripts jusqu'a validation du master, puis nettoyer les scripts de restauration si necessaire.
+5. Apres succes, conserver les transcripts jusqu'a validation du master puis les archiver/supprimer selon vos procedures.
 
 ## Bonnes pratiques
 
@@ -139,4 +135,4 @@ Ensemble d'outils PowerShell pour preparer un master Windows avant generalisatio
 - S'assurer que BitLocker est suspendu durablement avant de lancer Sysprep.
 - Utiliser `-WhatIf` pour valider les actions prevues sans modification.
 - Verifier les transcripts pour toute investigation (toutes les commandes y sont journalisees).
-- Supprimer les artefacts sensibles (transcripts, scripts de restauration) une fois le master valide.
+- Supprimer les artefacts sensibles (transcripts) une fois le master valide.
