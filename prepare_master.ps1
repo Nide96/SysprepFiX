@@ -55,6 +55,16 @@ function Resolve-ScriptRelativePath {
     return Join-Path -Path $scriptDir -ChildPath $Path
 }
 
+function Normalize-Drive {
+    param([string]$MountPoint)
+    if ([string]::IsNullOrWhiteSpace($MountPoint)) { return $MountPoint }
+    $s = $MountPoint.Trim()
+    if ($s.Length -eq 1 -and $s -match '^[A-Za-z]$') { return "${s}:" }
+    if ($s.Length -ge 2 -and $s[1] -eq ':') { return ("{0}:" -f $s[0]) }
+    if ($s -match '^[A-Za-z]:\\$') { return $s.Substring(0,2) }
+    return $s
+}
+
 function Set-ConsoleTheme {
     param(
         [ConsoleColor]$Foreground = [ConsoleColor]::Gray,
@@ -164,91 +174,12 @@ function Disable-UpdateServices {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param()
 
-    $services = @('wuauserv','bits','UsoSvc','dosvc','TrustedInstaller')
-    $states = @()
-    $serviceInfo = @{}
-
-    $doKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'
-    $doAction = 'Configurer Delivery Optimization en mode 99 (bypass)'
-    if ($PSCmdlet.ShouldProcess($doKey, $doAction)) {
-        try {
-            New-Item -Path $doKey -Force | Out-Null
-            New-ItemProperty -Path $doKey -Name 'DODownloadMode' -PropertyType DWord -Value 99 -Force | Out-Null
-            Write-Log 'Delivery Optimization configuree en mode 99 (bypass).' -ForegroundColor Cyan
-        } catch {
-            Write-Log "Impossible de definir la strategie Delivery Optimization : $($_.Exception.Message)" -ForegroundColor DarkRed
-        }
-    } else {
-        Write-Log "(WhatIf) Delivery Optimization conserverait sa configuration actuelle." -ForegroundColor DarkCyan
-    }
-
-    foreach ($name in $services) {
-        $svc = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction SilentlyContinue
-        if (-not $svc) {
-            Write-Log "Service $name introuvable (ignore)." -ForegroundColor DarkYellow
-            continue
-        }
-        $serviceInfo[$name] = $svc
-        $states += [pscustomobject]@{
-            Name      = $svc.Name
-            StartMode = $svc.StartMode
-            State     = $svc.State
-        }
-    }
-
-    $stopOrder = @('wuauserv','bits','UsoSvc')
-    foreach ($name in $stopOrder) {
-        if (-not $serviceInfo.ContainsKey($name)) { continue }
-        $targetLabel = "Service $name"
-        if ($PSCmdlet.ShouldProcess($targetLabel, 'Arret + desactivation (Startup=Disabled)')) {
-            Write-Log "Arret de $name..." -ForegroundColor Cyan
-            try {
-                Stop-Service -Name $name -Force -ErrorAction Stop
-            } catch {
-                Write-Log "Echec de l'arret de $name : $($_.Exception.Message)" -ForegroundColor DarkRed
-            }
-            try {
-                Write-Log "Desactivation de $name (Start=Disabled)." -ForegroundColor Cyan
-                Set-Service -Name $name -StartupType Disabled -ErrorAction Stop
-            } catch {
-                Write-Log "Echec de la desactivation de $name : $($_.Exception.Message)" -ForegroundColor DarkRed
-            }
-        } else {
-            Write-Log "(WhatIf) $name resterait dans son etat actuel (aucun Stop/Disable)." -ForegroundColor DarkCyan
-        }
-    }
-
-    if ($serviceInfo.ContainsKey('dosvc')) {
-        $dosvcLabel = 'Service dosvc'
-        if ($PSCmdlet.ShouldProcess($dosvcLabel, 'Arret temporaire (mode DO bypass)')) {
-            Write-Log 'Arret de dosvc...' -ForegroundColor Cyan
-            try {
-                Stop-Service -Name 'dosvc' -Force -ErrorAction Stop
-            } catch {
-                Write-Log "Echec de l'arret de dosvc : $($_.Exception.Message)" -ForegroundColor DarkRed
-            }
-            Write-Log 'Start de dosvc conserve (bypass via strategie DO).' -ForegroundColor Yellow
-        } else {
-            Write-Log "(WhatIf) dosvc ne serait pas arrete (bypass via DO seulement)." -ForegroundColor DarkCyan
-        }
-    }
-
-    return $states
+    Write-Log 'Gel automatique des services Windows Update desactive (aucune action).' -ForegroundColor Yellow
+    return @()
 }
 
 function Disable-TrustedInstallerService {
-    Write-Log 'Gel du service TrustedInstaller...' -ForegroundColor Cyan
-    try {
-        Stop-Service -Name 'TrustedInstaller' -Force -ErrorAction Stop
-    } catch {
-        Write-Log ("Arrêt TrustedInstaller : {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
-    }
-    try {
-        Set-Service -Name 'TrustedInstaller' -StartupType Disabled -ErrorAction Stop
-        Write-Log 'TrustedInstaller configuré sur Disabled.' -ForegroundColor Cyan
-    } catch {
-        Write-Log ("Impossible de désactiver TrustedInstaller : {0}" -f $_.Exception.Message) -ForegroundColor DarkRed
-    }
+    Write-Log 'La desactivation de TrustedInstaller est desactivee (aucune modification).' -ForegroundColor Yellow
 }
 
 function Invoke-DismComponentCleanup {
@@ -705,7 +636,8 @@ function Get-BitLockerStatusInfo {
     }
 
     try {
-        $output = & $manageBde -status $MountPoint 2>$null
+        $norm = Normalize-Drive $MountPoint
+        $output = & $manageBde -status $norm 2>$null
     } catch {
         return $null
     }
@@ -780,6 +712,31 @@ function Invoke-BitLockerDisable {
         $CmdletContext
     )
 
+    $hasDisableCmd = $null -ne (Get-Command -Name 'Disable-BitLocker' -ErrorAction SilentlyContinue)
+    if ($hasDisableCmd) {
+        $shouldRun = $true
+        if ($CmdletContext -and $CmdletContext -is [System.Management.Automation.PSCmdlet]) {
+            $shouldRun = $CmdletContext.ShouldProcess($MountPoint, 'Disable-BitLocker (dechiffrement complet)')
+        }
+        if (-not $shouldRun) {
+            Write-Log "(WhatIf) Disable-BitLocker $MountPoint" -ForegroundColor DarkCyan
+            return $false
+        }
+
+        $norm = Normalize-Drive $MountPoint
+        Write-Log ("Lancement Disable-BitLocker {0} (dechiffrement du volume)." -f $norm) -ForegroundColor Yellow
+        Write-Log ("Remarque : le dechiffrement peut prendre un certain temps. Suivez 'manage-bde -status {0}' pour surveiller l'avancement jusqu'a 0%." -f $norm) -ForegroundColor Yellow
+        try {
+            Disable-BitLocker -MountPoint $MountPoint -Confirm:$false -ErrorAction Stop | Out-Null
+            Write-Log ("Commande Disable-BitLocker initiee pour {0}. Surveillez 'manage-bde -status {0}' jusqu'a ce que le pourcentage chiffre atteigne 0%." -f $norm) -ForegroundColor Yellow
+            try { Start-Process -FilePath 'control.exe' -ArgumentList '/name','Microsoft.BitLockerDriveEncryption' -WindowStyle Normal -ErrorAction Stop | Out-Null } catch { Write-Verbose $_ }
+            return $true
+        } catch {
+            Write-Log ("Echec Disable-BitLocker {0} : {1}" -f $MountPoint, $_.Exception.Message) -ForegroundColor DarkRed
+            return $false
+        }
+    }
+
     $manageBde = Join-Path $env:WINDIR 'System32\manage-bde.exe'
     if (-not (Test-Path -LiteralPath $manageBde)) {
         Write-Log "manage-bde.exe introuvable : impossible de lancer automatiquement la commande -off." -ForegroundColor DarkRed
@@ -795,16 +752,19 @@ function Invoke-BitLockerDisable {
         return $false
     }
 
-    Write-Log ("Lancement manage-bde -off {0} (dechiffrement du volume)." -f $MountPoint) -ForegroundColor Yellow
+    $norm = Normalize-Drive $MountPoint
+    Write-Log ("Lancement manage-bde -off {0} (dechiffrement du volume)." -f $norm) -ForegroundColor Yellow
+    Write-Log ("Remarque : le dechiffrement peut prendre un certain temps. Suivez 'manage-bde -status {0}' pour surveiller l'avancement jusqu'a 0%." -f $norm) -ForegroundColor Yellow
     try {
-        & $manageBde -off $MountPoint 2>&1 | ForEach-Object {
+        & $manageBde -off $norm 2>&1 | ForEach-Object {
             if ($_ -is [string]) {
                 if ($_) { Write-Log "  $($_)" -ForegroundColor DarkCyan }
             } elseif ($_ -ne $null) {
                 Write-Log ("  {0}" -f $_) -ForegroundColor DarkCyan
             }
         }
-        Write-Log ("Commande manage-bde -off initiee pour {0}. Surveillez 'manage-bde -status {0}' jusqu'a ce que le pourcentage chiffre atteigne 0 et que la version soit 'Aucun'." -f $MountPoint) -ForegroundColor Yellow
+        Write-Log ("Commande manage-bde -off initiee pour {0}. Surveillez 'manage-bde -status {0}' jusqu'a ce que le pourcentage chiffre atteigne 0%." -f $norm) -ForegroundColor Yellow
+        try { Start-Process -FilePath 'control.exe' -ArgumentList '/name','Microsoft.BitLockerDriveEncryption' -WindowStyle Normal -ErrorAction Stop | Out-Null } catch { Write-Verbose $_ }
         return $true
     } catch {
         Write-Log ("Echec manage-bde -off {0} : {1}" -f $MountPoint, $_.Exception.Message) -ForegroundColor DarkRed
@@ -869,7 +829,7 @@ function Test-BitLockerReady {
     }
 }
 
-$allReady = ($versionReady -and $percentageReady -and $protectionReady -and $conversionReady)
+$allReady = ($percentageReady -and $protectionReady -and $conversionReady)
 if ($allReady) {
     $script:BitLockerOverridePreviouslyAllowed = $true
 }
@@ -901,8 +861,9 @@ function Suspend-SystemBitLocker {
             Write-Log ("Suspend-BitLocker a retourne une erreur sur {0} : {1}" -f $label, $_.Exception.Message) -ForegroundColor DarkRed
         }
         try {
-            Write-Log ("manage-bde -protectors -disable {0}" -f $target) -ForegroundColor Cyan
-            & manage-bde -protectors -disable $target 2>$null | Out-Null
+        $normTarget = Normalize-Drive $target
+        Write-Log ("manage-bde -protectors -disable {0}" -f $normTarget) -ForegroundColor Cyan
+        & manage-bde -protectors -disable $normTarget 2>$null | Out-Null
         } catch {
             Write-Log ("Echec manage-bde -protectors -disable {0} : {1}" -f $target, $_.Exception.Message) -ForegroundColor DarkRed
         }
@@ -920,7 +881,8 @@ function Suspend-SystemBitLocker {
         }
 
         try {
-            $statusLines = (& manage-bde -status $target 2>$null) -join "`n"
+            $normTarget = Normalize-Drive $target
+            $statusLines = (& manage-bde -status $normTarget 2>$null) -join "`n"
             if ($statusLines -match '(?i)red.marrage.*restant' -or $statusLines -match '(?i)restart.*remaining') {
                 Write-Log ("Attention : un redemarrage est requis pour finaliser la suspension de BitLocker sur {0}." -f $label) -ForegroundColor Yellow
                 $script:BitLockerRebootRequired = $true
@@ -984,7 +946,7 @@ function Assert-BitLockerGeneralizeReady {
                 Write-Log "Detail manage-bde -status :" -ForegroundColor DarkYellow
                 $statusInfo.Raw.Split("`n") | ForEach-Object { Write-Log ("  {0}" -f $_) -ForegroundColor DarkYellow }
             }
-            if ($versionReady -and $protectionReady -and $conversionReady -and $percentageReady) {
+            if ($protectionReady -and $conversionReady -and $percentageReady) {
                 Write-Log ("BitLocker deja confirme comme off sur {0} (Protection={1}, Chiffrement={2}%, Etat={3}, Version={4})." -f $label, $protectionStatus, $pctText, $volumeStatus, $versionString) -ForegroundColor Green
                 $script:BitLockerOverridePreviouslyAllowed = $true
                 continue
@@ -995,8 +957,11 @@ function Assert-BitLockerGeneralizeReady {
                     $script:BitLockerOffRequested = $true
                 }
             }
+            $monitorCmd = "manage-bde -status {0}" -f $label
             Write-Log ("Desactivez ou dechiffrez completement ce volume (ex : manage-bde -off {0}) avant de relancer ce script. Sysprep echouera sinon avec le code 0x80310039." -f $label) -ForegroundColor Yellow
-            throw 'BitLocker toujours actif : Sysprep refuse de continuer.'
+            Write-Log ("Important : le dechiffrement peut deja etre en cours et prendre plusieurs dizaines de minutes. Suivez '{0}' jusqu'a ce que Protection=Off et Pourcentage=0%." -f $monitorCmd) -ForegroundColor Yellow
+            Write-Log ("Execution interrompue : BitLocker est toujours actif sur {0}. Relancez prepare_master.ps1 uniquement lorsque '{1}' indique 0%." -f $label, $monitorCmd) -ForegroundColor Red
+            exit 1
         }
 
         if ($script:BitLockerOverridePreviouslyAllowed) {
@@ -1107,11 +1072,15 @@ try {
         Invoke-DismComponentCleanup
         Disable-TrustedInstallerService
         Get-ChildItem -Path $scriptDir -Filter 'restore-update-services-*.bat' -ErrorAction SilentlyContinue | Remove-Item -Force
-        $restoreScript = Join-Path $scriptDir ("restore-update-services-{0:yyyyMMdd-HHmmss}.bat" -f (Get-Date))
-        Export-ServiceRestoreScript -ServiceStates $phaseServiceStates -OutputPath $restoreScript
-        Write-Log "Script de restauration des services : $restoreScript" -ForegroundColor Yellow
-        try { Save-ServiceStatesToFile -ServiceStates $phaseServiceStates -Path $serviceStatePath } catch {
-            Write-Log ("Impossible d'enregistrer l'etat des services : {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+        if ($phaseServiceStates -and $phaseServiceStates.Count -gt 0) {
+            $restoreScript = Join-Path $scriptDir ("restore-update-services-{0:yyyyMMdd-HHmmss}.bat" -f (Get-Date))
+            Export-ServiceRestoreScript -ServiceStates $phaseServiceStates -OutputPath $restoreScript
+            Write-Log "Script de restauration des services : $restoreScript" -ForegroundColor Yellow
+            try { Save-ServiceStatesToFile -ServiceStates $phaseServiceStates -Path $serviceStatePath } catch {
+                Write-Log ("Impossible d'enregistrer l'etat des services : {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+            }
+        } else {
+            Write-Log 'Aucun script de restauration ni snapshot de services n''est genere (gel desactive).' -ForegroundColor Yellow
         }
 
         if (-not $SkipBitLockerSuspend) {
